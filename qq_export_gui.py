@@ -8,9 +8,15 @@ import sys
 import os
 import re
 import json
-import struct
 import subprocess
 import threading
+import time
+import tempfile
+import html as html_mod
+import sqlite3
+import traceback
+import ctypes
+import ctypes.wintypes
 from datetime import datetime
 from collections import defaultdict
 
@@ -19,9 +25,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QProgressBar, QGroupBox,
     QFileDialog, QMessageBox, QCheckBox, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QStatusBar, QAbstractItemView, QSplitter, QComboBox
+    QStatusBar, QAbstractItemView, QSplitter
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QThread
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 # ============ 常量 ============
@@ -36,12 +42,14 @@ FIELD_SENDER_NAME = '40090'
 FIELD_BODY = '40800'  # Protobuf消息体
 FIELD_MSG_FLAG = '40105'
 
-MSG_TYPE_MAP = {
-    1: "文本", 2: "图片", 3: "语音", 4: "视频", 5: "文件",
-    6: "链接", 7: "表情", 8: "红包", 9: "名片",
-    10: "位置", 11: "合并转发", 12: "拍一拍",
-    13: "系统消息", 14: "撤回消息", 15: "群公告",
-}
+# SQLCipher PRAGMA 参数（QQ NT 固定参数）
+SQLCIPHER_PRAGMAS = [
+    "PRAGMA cipher_page_size = 4096",
+    "PRAGMA kdf_iter = 4000",
+    "PRAGMA cipher_hmac_algorithm = HMAC_SHA1",
+    "PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512",
+    "PRAGMA cipher = 'aes-256-cbc'",
+]
 
 
 # ============ 信号中转 ============
@@ -142,7 +150,8 @@ def decode_protobuf_text(body_bytes):
     
     try:
         outer = _parse_protobuf_fields(body_bytes)
-    except Exception:
+    except Exception as e:
+        # Protobuf 解析失败静默处理，返回空字符串
         return ""
     
     # 获取所有消息元素（field 40800，可重复）
@@ -160,7 +169,7 @@ def decode_protobuf_text(body_bytes):
         try:
             element = _parse_protobuf_fields(element_bytes)
         except Exception:
-            continue
+            continue  # 单个消息元素解析失败，跳过
         
         # 获取消息类型
         msg_type = 0
@@ -180,23 +189,18 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(t)
-                        except:
+                        except UnicodeDecodeError:
                             pass
         elif msg_type == 2:
-            # 图片
             parts.append("[图片]")
         elif msg_type == 3:
-            # 语音
             parts.append("[语音]")
         elif msg_type == 4:
-            # 视频
             parts.append("[视频]")
         elif msg_type == 5:
-            # 文件
             parts.append("[文件]")
         elif msg_type == 6:
-            # 链接
-            # 尝试提取链接文本
+            # 链接：尝试提取链接文本
             if 45101 in element:
                 for wt2, val in element[45101]:
                     if wt2 == 2:
@@ -204,7 +208,7 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(t)
-                        except:
+                        except UnicodeDecodeError:
                             pass
             else:
                 parts.append("[链接]")
@@ -217,18 +221,15 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(f"[{t}]")
-                        except:
+                        except UnicodeDecodeError:
                             pass
             else:
                 parts.append("[表情]")
         elif msg_type == 8:
-            # 红包
             parts.append("[红包]")
         elif msg_type == 10:
-            # 位置
             parts.append("[位置]")
         elif msg_type == 11:
-            # 合并转发
             parts.append("[合并转发]")
         elif msg_type == 12:
             # 拍一拍
@@ -239,7 +240,7 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(f"[拍一拍: {t}]")
-                        except:
+                        except UnicodeDecodeError:
                             pass
             else:
                 parts.append("[拍一拍]")
@@ -252,7 +253,7 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(t)
-                        except:
+                        except UnicodeDecodeError:
                             pass
         else:
             # 未知类型，尝试提取文本
@@ -263,7 +264,7 @@ def decode_protobuf_text(body_bytes):
                             t = val.decode('utf-8').strip()
                             if t:
                                 parts.append(t)
-                        except:
+                        except UnicodeDecodeError:
                             pass
     
     result = '\n'.join(parts)
@@ -398,8 +399,8 @@ class QQExporter:
                     install_dir = os.path.dirname(line)
                     self.log(f"进程找到QQ安装目录: {install_dir}")
                     return install_dir
-        except:
-            pass
+        except Exception:
+            pass  # wmic 可能不可用
 
         # === 方法2：从桌面快捷方式解析 ===
         desktop_dir = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
@@ -418,8 +419,8 @@ class QQExporter:
                             install_dir = os.path.dirname(target)
                             self.log(f"快捷方式找到QQ安装目录: {install_dir}")
                             return install_dir
-                    except:
-                        pass
+                    except Exception:
+                        pass  # 快捷方式解析可能失败
 
         # === 方法3：注册表搜索（HKCU + HKLM） ===
         for hive in [r"HKCU\SOFTWARE", r"HKLM\SOFTWARE"]:
@@ -436,8 +437,8 @@ class QQExporter:
                             if path and os.path.exists(os.path.join(path, "QQ.exe")):
                                 self.log(f"注册表找到QQ安装目录: {path}")
                                 return path
-                except:
-                    pass
+                except Exception:
+                    pass  # 注册表查询可能失败
 
         # === 方法4：全盘扫描根目录和Program Files ===
         drives = self._get_all_drives()
@@ -515,8 +516,8 @@ class QQExporter:
                                     elif not qq_number and (d.isdigit() or (len(d) >= 5 and d[0].isdigit())):
                                         self.log(f"从安装路径推断数据目录: {full}")
                                         return full
-        except:
-            pass
+        except Exception:
+            pass  # wmic 进程命令行读取可能失败
 
         # === 方法2：全盘扫描 ===
         drives = self._get_all_drives()
@@ -710,7 +711,6 @@ class QQExporter:
         注意：此方法会阻塞较长时间（等待用户登录），需要子线程运行
         """
         # 检测QQ是否正在运行，必须彻底关闭后才能用调试器法
-        import time
         try:
             r = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq QQ.exe", "/FO", "CSV", "/NH"],
@@ -751,7 +751,7 @@ class QQExporter:
                 
                 self.log("✅ QQ进程已关闭")
         except Exception:
-            pass  # 检测失败不影响后续
+            pass  # tasklist 检测可能失败，不影响后续
         
         self.log("📋 流程说明：")
         self.log("  1. 脚本将以调试模式启动QQ")
@@ -771,20 +771,18 @@ class QQExporter:
             # 方案：创建临时包装脚本，捕获所有输出
             # 问题：Write-Host输出不经过stdout，Popen捕获不到
             # 解决：用临时脚本包装，将Write-Host重写为Write-Output
-            import tempfile
             wrapper_script = os.path.join(tempfile.gettempdir(), "qq_key_extract_wrapper.ps1")
             # 读取原始脚本，替换Write-Host为Write-Output
             with open(script_path, 'r', encoding='utf-8') as f:
                 original_content = f.read()
             # 替换Write-Host为Write-Output（保留参数但去掉-ForegroundColor等仅显示参数）
-            import re as _re
-            modified = _re.sub(
+            modified = re.sub(
                 r'Write-Host\s+',
                 'Write-Output ',
                 original_content
             )
             # 去掉-ForegroundColor参数（Write-Output不支持）
-            modified = _re.sub(
+            modified = re.sub(
                 r'\s+-ForegroundColor\s+\w+',
                 '',
                 modified
@@ -793,11 +791,11 @@ class QQExporter:
             # 原脚本在PS5下会重新读取自身并执行一遍（第56-75行），
             # 导致整个脚本执行两次，QQ被启动两次，用户需要登录两次。
             # 我们的wrapper已经是UTF-8编码写入的，不需要重载。
-            modified = _re.sub(
+            modified = re.sub(
                 r'#region\s+Reload\s+Script\s+as\s+UTF-8.*?#endregion',
                 '',
                 modified,
-                flags=_re.DOTALL
+                flags=re.DOTALL
             )
             with open(wrapper_script, 'w', encoding='utf-8-sig') as f:
                 f.write(modified)
@@ -821,7 +819,6 @@ class QQExporter:
             )
             
             # 实时读取输出，最多等5分钟（用户登录可能慢）
-            import time
             output_lines = []
             key = ""
             start_time = time.time()
@@ -850,7 +847,7 @@ class QQExporter:
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
-                    except:
+                    except subprocess.TimeoutExpired:
                         proc.kill()
                     return ""
                 
@@ -895,18 +892,18 @@ class QQExporter:
                                     try:
                                         subprocess.run(["taskkill", "/IM", "QQ.exe", "/F"],
                                                      capture_output=True, timeout=10)
-                                    except:
-                                        pass
-                except:
-                    pass
+                                    except Exception:
+                                        pass  # taskkill 可能失败
+                except Exception:
+                    pass  # stdout.readline 可能因进程退出而失败
             
             # 进程结束，读取剩余输出
             try:
                 remaining = proc.stdout.read()
                 if remaining:
                     output_lines.extend(remaining.strip().split('\n'))
-            except:
-                pass
+            except Exception:
+                pass  # 进程可能已完全关闭
             
             full_output = '\n'.join(output_lines)
             
@@ -956,7 +953,6 @@ class QQExporter:
                 # 密钥已提取成功，确保所有QQ进程都被杀掉
                 # QQ NT是Chromium多进程架构，调试器只终止主进程，
                 # 子进程（Renderer/GPU等）可能仍在运行并弹出登录窗口
-                import time
                 try:
                     subprocess.run(["taskkill", "/IM", "QQ.exe", "/F"],
                                  capture_output=True, timeout=10)
@@ -978,9 +974,6 @@ class QQExporter:
             self.log(f"调试器法未找到密钥。脚本输出:\n{full_output[:500]}", "warn")
             return ""
             
-            self.log(f"调试器法未找到密钥。脚本输出:\n{full_output[:500]}", "warn")
-            return ""
-            
         except Exception as e:
             self.log(f"调试器法失败: {e}", "error")
             return ""
@@ -988,10 +981,6 @@ class QQExporter:
     def _search_key_in_process(self):
         """从已运行的QQ进程内存中搜索数据库密钥（静默收集+数据库验证）
         支持16位和32位密钥，分块读取避免卡死"""
-        import ctypes
-        import ctypes.wintypes
-        import time
-        
         # Windows API 常量
         PROCESS_VM_READ = 0x0010
         PROCESS_QUERY_INFORMATION = 0x0400
@@ -1058,52 +1047,6 @@ class QQExporter:
         
         if not db_path_for_verify:
             self.log("⚠️ 无验证数据库，找到的候选密钥无法自动验证", "warn")
-        
-        # 准备数据库验证函数
-        _verify_tmp_path = None
-        def verify_key(key):
-            """快速验证密钥是否能解密数据库"""
-            nonlocal _verify_tmp_path
-            if not db_path_for_verify:
-                return False
-            try:
-                from sqlcipher3 import dbapi2 as sqlcipher
-            except ImportError:
-                try:
-                    from pysqlcipher3 import dbapi2 as sqlcipher
-                except ImportError:
-                    return False
-            import tempfile
-            try:
-                with open(db_path_for_verify, 'rb') as f:
-                    data = f.read()
-                sqlite_magic = b'SQLite format 3\x00'
-                clean_data = data[1024:] if not data.startswith(sqlite_magic) and len(data) > 1024 else data
-                tmp_path = os.path.join(tempfile.gettempdir(), "qq_key_verify.db")
-                with open(tmp_path, 'wb') as f:
-                    f.write(clean_data)
-                _verify_tmp_path = tmp_path
-                conn = sqlcipher.connect(tmp_path)
-                cur = conn.cursor()
-                cur.execute(f"PRAGMA key = '{key}'")
-                cur.execute("PRAGMA cipher_page_size = 4096")
-                cur.execute("PRAGMA kdf_iter = 4000")
-                cur.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA1")
-                cur.execute("PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512")
-                cur.execute("PRAGMA cipher = 'aes-256-cbc'")
-                cur.execute("SELECT count(*) FROM sqlite_master")
-                count = cur.fetchone()[0]
-                conn.close()
-                os.remove(tmp_path)
-                _verify_tmp_path = None
-                return count > 0
-            except:
-                try: conn.close()
-                except: pass
-                try: os.remove(tmp_path)
-                except: pass
-                _verify_tmp_path = None
-                return False
         
         # 从QQ进程内存中搜索密钥
         # QQ的密钥可能是16位或32位可见ASCII字符
@@ -1257,19 +1200,19 @@ class QQExporter:
                                                             # 每收集3个候选就验证一次（快速返回）
                                                             if len(batch_keys) >= 3 and db_path_for_verify:
                                                                 for bk in batch_keys:
-                                                                    if verify_key(bk):
+                                                                    if self._verify_key(bk, db_path_for_verify):
                                                                         verified_key = bk
                                                                         break
                                                                 if verified_key:
                                                                     break
                                                                 batch_keys = []
-                                                except:
-                                                    pass
+                                                except (UnicodeDecodeError, ValueError):
+                                                    pass  # 非 ASCII 字符或解码失败
                                             i = end
                                         else:
                                             i += 1
-                            except:
-                                pass
+                            except OSError:
+                                pass  # ReadProcessMemory 失败，跳过此 chunk
                             
                             offset_in_region += read_size
                     
@@ -1282,7 +1225,7 @@ class QQExporter:
                 if not verified_key and batch_keys and db_path_for_verify:
                     self.log(f"  正在验证 {len(batch_keys)} 个候选密钥...")
                     for bk in batch_keys:
-                        if verify_key(bk):
+                        if self._verify_key(bk, db_path_for_verify):
                             verified_key = bk
                             break
                     batch_keys = []
@@ -1321,6 +1264,46 @@ class QQExporter:
         self.log("未在QQ进程内存中找到候选密钥", "warn")
         return ""
     
+    def _verify_key(self, key, db_path_for_verify):
+        """快速验证密钥是否能解密数据库"""
+        if not db_path_for_verify:
+            return False
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher
+        except ImportError:
+            try:
+                from pysqlcipher3 import dbapi2 as sqlcipher
+            except ImportError:
+                return False
+        try:
+            with open(db_path_for_verify, 'rb') as f:
+                data = f.read()
+            sqlite_magic = b'SQLite format 3\x00'
+            clean_data = data[1024:] if not data.startswith(sqlite_magic) and len(data) > 1024 else data
+            tmp_path = os.path.join(tempfile.gettempdir(), "qq_key_verify.db")
+            with open(tmp_path, 'wb') as f:
+                f.write(clean_data)
+            conn = sqlcipher.connect(tmp_path)
+            cur = conn.cursor()
+            cur.execute(f"PRAGMA key = '{key}'")
+            for pragma in SQLCIPHER_PRAGMAS:
+                cur.execute(pragma)
+            cur.execute("SELECT count(*) FROM sqlite_master")
+            count = cur.fetchone()[0]
+            conn.close()
+            os.remove(tmp_path)
+            return count > 0
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False
+
     def decrypt_database(self, db_path, key):
         """解密QQ NT数据库（支持多种解密方式）"""
         if not os.path.exists(db_path):
@@ -1408,11 +1391,8 @@ class QQExporter:
         
         # 设置解密参数（QQ NT的SQLCipher参数）
         cur.execute(f"PRAGMA key = '{key}'")
-        cur.execute("PRAGMA cipher_page_size = 4096")
-        cur.execute("PRAGMA kdf_iter = 4000")
-        cur.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA1")
-        cur.execute("PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512")
-        cur.execute("PRAGMA cipher = 'aes-256-cbc'")
+        for pragma in SQLCIPHER_PRAGMAS:
+            cur.execute(pragma)
         
         # 验证解密是否成功
         try:
@@ -1451,8 +1431,8 @@ class QQExporter:
             result = subprocess.run(["where", "sqlcipher"], capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip().split('\n')[0].strip()
-        except:
-            pass
+        except Exception:
+            pass  # where 命令不可用
         
         return None
     
@@ -1464,13 +1444,10 @@ class QQExporter:
         decrypted_path = clean_path.replace('.clean.db', '.decrypted.db')
         
         # 构建SQL命令
+        pragma_lines = "\n".join(SQLCIPHER_PRAGMAS) + ";"
         sql_cmds = f"""
 PRAGMA key = '{key}';
-PRAGMA cipher_page_size = 4096;
-PRAGMA kdf_iter = 4000;
-PRAGMA cipher_hmac_algorithm = HMAC_SHA1;
-PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512;
-PRAGMA cipher = 'aes-256-cbc';
+{pragma_lines}
 ATTACH DATABASE '{decrypted_path}' AS plaintext KEY '';
 SELECT sqlcipher_export('plaintext');
 DETACH DATABASE plaintext;
@@ -1497,7 +1474,6 @@ DETACH DATABASE plaintext;
                 return None
             
             # 用普通sqlite3打开解密后的数据库
-            import sqlite3
             conn = sqlite3.connect(decrypted_path)
             cur = conn.cursor()
             
@@ -1552,30 +1528,7 @@ DETACH DATABASE plaintext;
         except Exception as e:
             self.log(f"读取联系人备注失败: {e}", "warn")
         
-        # 2. 从 profile_info.db 读取好友备注（buddy_list的1002列）
-        try:
-            if self.qq_data_dir:
-                profile_db_path = os.path.join(self.qq_data_dir, "nt_qq", "nt_db", "profile_info.db")
-                if os.path.exists(profile_db_path):
-                    self.log("正在解密 profile_info.db 加载好友备注...")
-                    profile_conn = self._open_aux_db(profile_db_path)
-                    if not profile_conn:
-                        self.log("profile_info.db 解密跳过（无需关注）", "info")
-                    if profile_conn:
-                        try:
-                            p_cur = profile_conn.cursor()
-                            # 直接从buddy_list的1002列读备注，用1001列(QQ号)匹配
-                            target_uins = ['1692804423', '2524024851', '2575428163', '3577921378', '1343042672']
-                            for uin in target_uins:
-                                row = p_cur.execute("SELECT [1000], [1002] FROM [buddy_list] WHERE [1001]=?", (uin,)).fetchone()
-                                if row:
-                                    self.log(f"[调试] profile_info.buddy_list UIN={uin}: uid={row[0]} remark={repr(row[1])}", "info")
-                        finally:
-                            profile_conn.close()
-        except Exception as e:
-            self.log(f"读取profile_info.db失败: {e}", "warn")
-
-        # 3. 从 group_info.db 读取群名
+# 2. 从 group_info.db 读取群名
         try:
             if not self.qq_data_dir:
                 self.log("未设置数据目录，跳过群名加载", "warn")
@@ -1632,11 +1585,8 @@ DETACH DATABASE plaintext;
             if has_custom_header:
                 # 有自定义头，需要解密
                 cur.execute(f"PRAGMA key = '{self.key}'")
-                cur.execute("PRAGMA cipher_page_size = 4096")
-                cur.execute("PRAGMA kdf_iter = 4000")
-                cur.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA1")
-                cur.execute("PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512")
-                cur.execute("PRAGMA cipher = 'aes-256-cbc'")
+                for pragma in SQLCIPHER_PRAGMAS:
+                    cur.execute(pragma)
             else:
                 # 没有自定义头，可能已解密或本身就是明文
                 cur.execute("PRAGMA key = ''")
@@ -1651,11 +1601,8 @@ DETACH DATABASE plaintext;
                     conn = sqlcipher_module.connect(clean_path)
                     cur = conn.cursor()
                     cur.execute(f"PRAGMA key = '{self.key}'")
-                    cur.execute("PRAGMA cipher_page_size = 4096")
-                    cur.execute("PRAGMA kdf_iter = 4000")
-                    cur.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA1")
-                    cur.execute("PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512")
-                    cur.execute("PRAGMA cipher = 'aes-256-cbc'")
+                    for pragma in SQLCIPHER_PRAGMAS:
+                        cur.execute(pragma)
                     cur.execute("SELECT count(*) FROM sqlite_master LIMIT 1")
 
             return conn
@@ -1663,8 +1610,8 @@ DETACH DATABASE plaintext;
             try:
                 if conn:
                     conn.close()
-            except:
-                pass
+            except Exception:
+                pass  # 关闭连接失败，忽略
             return None
     
     def scan_chats(self, conn, my_qq=""):
@@ -1680,8 +1627,6 @@ DETACH DATABASE plaintext;
         # 加载联系人备注和群名映射
         self.log("正在加载联系人备注...")
         qq_remarks, group_names = self._load_contact_remarks(conn)
-        self._qq_remarks = qq_remarks  # 保存供导出使用
-        self._group_names = group_names
         self.log(f"联系人映射共 {len(qq_remarks)} 个, 群名映射共 {len(group_names)} 个")
         
         # 扫描私聊
@@ -1900,8 +1845,6 @@ DETACH DATABASE plaintext;
             out_path: 输出路径
             chat_type: 'private' 或 'group'
         """
-        import html as html_mod
-        
         parts = []
         last_date = ''
         
@@ -1909,16 +1852,16 @@ DETACH DATABASE plaintext;
             ts = msg.get('timestamp', 0)
             if not ts:
                 continue
-            
+
             try:
                 dt = datetime.fromtimestamp(ts)
-            except:
-                continue
-            
+            except (OSError, ValueError, OverflowError):
+                continue  # 无效时间戳，跳过
+
             date_str = dt.strftime('%Y年%m月%d日')
             date_id = dt.strftime('%Y-%m-%d')
             time_str = dt.strftime('%H:%M')
-            
+
             if date_str != last_date:
                 parts.append(f'<div class="date-sep" id="date-{date_id}"><span>{date_str}</span></div>')
                 last_date = date_str
@@ -1954,7 +1897,7 @@ DETACH DATABASE plaintext;
                         <div class="bubble other-bubble">{content}</div>
                     </div>
                 </div>''')
-        
+
         # 日期选项
         date_set = []
         seen_dates = set()
@@ -1966,11 +1909,11 @@ DETACH DATABASE plaintext;
                     if ds not in seen_dates:
                         seen_dates.add(ds)
                         date_set.append(ds)
-                except:
-                    pass
+                except (OSError, ValueError, OverflowError):
+                    pass  # 无效时间戳，跳过
         date_options = ''.join(f'<option value="{d}">{d}</option>' for d in date_set)
-        
-        type_label = "群聊" if any(m.get('is_group') for m in messages) else "私聊"
+
+        type_label = "群聊" if chat_type == 'group' else "私聊"
         
         html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2056,9 +1999,9 @@ function jumpToDate() {{
                 ts = msg.get('timestamp', 0)
                 try:
                     time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '未知时间'
-                except:
+                except (OSError, ValueError, OverflowError):
                     time_str = '未知时间'
-                
+
                 is_me = msg.get('is_me', False)
                 if chat_type == 'group':
                     # 群聊：保留各人的sender_name，不替换成群名
@@ -2072,7 +2015,7 @@ function jumpToDate() {{
                 content = msg.get('text', '')
                 # 多元素消息（表情+文本+链接等）用空格连接，避免产生无时间戳的孤立行
                 content = content.replace('\n', ' ').strip()
-                
+
                 f.write(f"[{time_str}] {sender_name}: {content}\n")
     
     def _export_json(self, display_name, messages, out_path, chat_type='private'):
@@ -2094,14 +2037,14 @@ function jumpToDate() {{
             ts = msg.get('timestamp', 0)
             try:
                 time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else ''
-            except:
+            except (OSError, ValueError, OverflowError):
                 time_str = ''
-            
+
             is_me = msg.get('is_me', False)
             content = msg.get('text', '')
             # 多元素消息用空格连接
             content = content.replace('\n', ' ').strip()
-            
+
             msg_chat_type = msg.get('chat_type', 'private')
             # 私聊：qq_number是聊天对象；群聊：qq_number是发送者
             qq_number = msg.get('peer_uin', '') if msg_chat_type == 'private' else msg.get('sender_uin', '')
@@ -2406,6 +2349,8 @@ class QQExportGUI(QMainWindow):
         self.chat_table.itemChanged.connect(self._on_table_item_changed)
         self.chat_table.cellEntered.connect(self._on_cell_entered)
         self._hover_row = -1
+        # 初始化时设置一次手型光标，避免 _on_cell_entered 中重复设置
+        self.chat_table.viewport().setCursor(Qt.PointingHandCursor)
         chat_layout.addWidget(self.chat_table)
         
         # -- 日志区 --
@@ -2466,15 +2411,14 @@ class QQExportGUI(QMainWindow):
     
     def _check_admin(self):
         try:
-            import ctypes
             is_admin = ctypes.windll.shell32.IsUserAnAdmin()
             if not is_admin:
                 self.add_log("⚠️ 当前非管理员权限，密钥提取可能失败！", "warn")
                 self.add_log("请右键 → 以管理员身份运行本工具", "warn")
             else:
                 self.add_log("✅ 管理员权限检测通过", "success")
-        except:
-            pass
+        except Exception:
+            pass  # 非 Windows 或权限检测 API 不可用
     
     def _detect_wrapper_on_startup(self):
         """启动时自动检测QQ安装目录和wrapper.node（不需要QQ号）"""
@@ -2711,7 +2655,6 @@ class QQExportGUI(QMainWindow):
                 self.signals.chat_list.emit(chat_list)
                 self.signals.all_done.emit(True, f"扫描完成！共 {len(chat_list)} 个聊天")
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 self.signals.all_done.emit(False, f"错误: {e}")
         
@@ -2754,7 +2697,6 @@ class QQExportGUI(QMainWindow):
                 self.exporter.export_chats(selected, fmt)
                 self.signals.all_done.emit(True, f"导出完成！共 {len(selected)} 个聊天")
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 self.signals.all_done.emit(False, f"导出失败: {e}")
         
@@ -2896,7 +2838,6 @@ class QQExportGUI(QMainWindow):
                 html_path = self._generate_chat_preview(chat)
                 self._open_preview_signal.emit(html_path)
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 self.signals.all_done.emit(False, f"加载聊天失败: {e}")
         
@@ -2908,8 +2849,6 @@ class QQExportGUI(QMainWindow):
         messages = chat['messages']
         is_group = chat.get('is_group', False)
         
-        import html as html_mod
-        
         parts = []
         last_date = ''
         
@@ -2919,13 +2858,13 @@ class QQExportGUI(QMainWindow):
                 continue
             try:
                 dt = datetime.fromtimestamp(ts)
-            except:
-                continue
-            
+            except (OSError, ValueError, OverflowError):
+                continue  # 无效时间戳，跳过
+
             date_str = dt.strftime('%Y年%m月%d日')
             date_id = dt.strftime('%Y-%m-%d')
             time_str = dt.strftime('%H:%M')
-            
+
             if date_str != last_date:
                 parts.append(f'<div class="date-sep" id="date-{date_id}"><span>{date_str}</span></div>')
                 last_date = date_str
@@ -2972,10 +2911,10 @@ class QQExportGUI(QMainWindow):
                     if ds not in seen_dates:
                         seen_dates.add(ds)
                         date_set.append(ds)
-                except:
-                    pass
+                except (OSError, ValueError, OverflowError):
+                    pass  # 无效时间戳，跳过
         date_options = ''.join(f'<option value="{d}">{d}</option>' for d in date_set)
-        
+
         type_label = "群聊" if is_group else "私聊"
         
         html = f'''<!DOCTYPE html>
@@ -3043,6 +2982,17 @@ function jumpToDate() {{
         
         out_dir = os.path.join(self._get_output_dir(), "chat_preview")
         os.makedirs(out_dir, exist_ok=True)
+        # 清理旧的预览文件，避免堆积
+        try:
+            for old_file in os.listdir(out_dir):
+                if old_file.endswith('_preview.html'):
+                    old_path = os.path.join(out_dir, old_file)
+                    try:
+                        os.remove(old_path)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
         safe_name = "".join(c if c.isalnum() or c in '_-' else '_' for c in display_name)
         out_path = os.path.join(out_dir, f"{safe_name}_preview.html")
         
@@ -3085,8 +3035,8 @@ function jumpToDate() {{
             h = header.height()
             self._header_check.setGeometry(x + (w - 16) // 2, (h - 16) // 2, 16, 16)
             self._header_check.show()
-        except:
-            pass
+        except Exception:
+            pass  # header 布局可能还未完成
     
     def _on_header_check_changed(self, state):
         checked = (state == Qt.Checked)
@@ -3120,7 +3070,6 @@ function jumpToDate() {{
             self._sync_header_check_state()
     
     def _on_cell_entered(self, row, col):
-        self.chat_table.viewport().setCursor(Qt.PointingHandCursor)
         if row == self._hover_row:
             return
         if self._hover_row >= 0 and self._hover_row < self.chat_table.rowCount():
@@ -3140,8 +3089,8 @@ function jumpToDate() {{
         if self._db_conn:
             try:
                 self._db_conn.close()
-            except:
-                pass
+            except Exception:
+                pass  # 数据库连接关闭失败，忽略
         event.accept()
 
 
